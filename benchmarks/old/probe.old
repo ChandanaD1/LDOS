@@ -1,0 +1,146 @@
+#!/usr/bin/env python3
+"""
+probe.py -- answers: when a huge page is evicted, is it swapped out WHOLE or
+SPLIT, and is swap-in 4KB or 2MB?  Also usable later as the "is swap clean or
+fragmented?" check (run with a small --size-mb at the start of an E3 run).
+
+  sudo ./probe.py --size-mb 1024 --reclaim-mb 512
+
+Requires: root, cgroup v2, swap enabled (swapon --show), ./memhog built.
+"""
+import argparse
+import os
+import subprocess
+import sys
+import time
+
+from sampler import snapshot, find_kthreads
+
+THP = "/sys/kernel/mm/transparent_hugepage"
+CG_ROOT = "/sys/fs/cgroup"
+PAGE_CLUSTER = "/proc/sys/vm/page-cluster"
+
+
+def write(path, val):
+    with open(path, "w") as f:
+        f.write(str(val))
+
+
+def read(path):
+    with open(path) as f:
+        return f.read().strip()
+
+
+def wait_swap_settle(cg, timeout=30):
+    """memory.reclaim returns once pages are unmapped, but swap writes finish
+    asynchronously. Wait until the cgroup's swap usage stops changing."""
+    last, stable, t0 = -1, 0, time.time()
+    while time.time() - t0 < timeout:
+        cur = int(read(os.path.join(cg, "memory.swap.current")))
+        stable = stable + 1 if cur == last else 0
+        if stable >= 3:
+            return
+        last = cur
+        time.sleep(0.5)
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--size-mb", type=int, default=1024)
+    ap.add_argument("--reclaim-mb", type=int, default=512)
+    ap.add_argument("--memhog", default=os.path.join(os.path.dirname(os.path.abspath(__file__)), "memhog"))
+    a = ap.parse_args()
+
+    if os.geteuid() != 0:
+        sys.exit("run as root")
+    with open("/proc/swaps") as f:
+        if len(f.read().strip().splitlines()) < 2:
+            sys.exit("no swap device active (swapon --show is empty)")
+    if not os.path.exists(os.path.join(CG_ROOT, "cgroup.controllers")):
+        sys.exit("cgroup v2 not mounted at /sys/fs/cgroup")
+
+    old_cluster = read(PAGE_CLUSTER)
+    write(PAGE_CLUSTER, 0)               # no swap-in readahead: one fault -> pswpin +1 if 4KB
+    write(THP + "/enabled", "always")    # we need real huge pages to exist
+    try:
+        write(CG_ROOT + "/cgroup.subtree_control", "+memory")
+    except OSError:
+        pass                              # already enabled
+    cg = os.path.join(CG_ROOT, "thp_probe")
+    os.makedirs(cg, exist_ok=True)
+    write(cg + "/memory.max", "max")      # limit not needed: we force eviction explicitly
+    write(cg + "/memory.swap.max", "max")
+
+    def enter():
+        write(os.path.join(cg, "cgroup.procs"), os.getpid())
+
+    groups = find_kthreads()
+    child = subprocess.Popen([a.memhog, "--size-mb", str(a.size_mb), "--duration", "0", "--probe"],
+                             stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True, bufsize=1,
+                             preexec_fn=enter)
+    try:
+        for line in child.stdout:
+            print("memhog:", line.rstrip())
+            if line.startswith("READY"):
+                break
+        else:
+            sys.exit("memhog exited before READY")
+
+        snap_a = snapshot(groups, cg)
+        print("\nrequesting eviction of %d MB (anon-biased)..." % a.reclaim_mb)
+        try:
+            write(cg + "/memory.reclaim", "%dM swappiness=200" % a.reclaim_mb)
+        except OSError as e:
+            if e.errno == 22:     # EINVAL: swappiness= option unsupported -> plain form
+                try:
+                    write(cg + "/memory.reclaim", "%dM" % a.reclaim_mb)
+                except OSError as e2:
+                    print("memory.reclaim:", e2)
+            else:
+                print("memory.reclaim returned %s (usually: could not reclaim the full amount)" % e)
+        wait_swap_settle(cg)
+        snap_b = snapshot(groups, cg)
+
+        child.stdin.write("go\n")
+        child.stdin.flush()
+        for line in child.stdout:
+            print("memhog:", line.rstrip())
+            if line.startswith("DONE"):
+                break
+        snap_c = snapshot(groups, cg)
+    finally:
+        child.kill()
+        child.wait()
+        try:
+            os.rmdir(cg)
+        except OSError:
+            pass
+        write(PAGE_CLUSTER, old_cluster)
+
+    def d(x, y, k):
+        return y.get(k, 0) - x.get(k, 0)
+
+    focus = ["thp_swpout", "thp_swpout_fallback", "thp_split_page", "thp_split_page_failed",
+             "pswpout", "pswpin", "pgmajfault",
+             "mthp2M_swpout", "mthp2M_swpout_fallback", "mthp2M_swpin", "mthp2M_swpin_fallback"]
+    print("\n%-26s %14s %14s" % ("counter", "reclaim phase", "swap-in phase"))
+    for k in focus:
+        if k in snap_a or k in snap_c:
+            print("%-26s %14d %14d" % (k, d(snap_a, snap_b, k), d(snap_b, snap_c, k)))
+
+    out_ok, out_fb = d(snap_a, snap_b, "thp_swpout"), d(snap_a, snap_b, "thp_swpout_fallback")
+    print("\nReading it:")
+    if out_ok + out_fb == 0:
+        print(" - no THP swap-out activity: check that AnonHugePages was ~size (after_alloc_anon_huge_mb above)"
+              " and that the swap device is non-rotational (lsblk -d -o NAME,ROTA).")
+    else:
+        print(" - swap-out: %d whole, %d fell back to split (fallback fraction %.2f)"
+              % (out_ok, out_fb, out_fb / (out_ok + out_fb)))
+    pin = d(snap_b, snap_c, "pswpin")
+    large = d(snap_b, snap_c, "mthp2M_swpin")
+    print(" - one-byte read caused pswpin += %d, per-size swpin += %d" % (pin, large))
+    print("   (page-cluster was 0, so +1 means a 4KB swap-in; ~512 or per-size swpin > 0 means a whole 2MB came back)")
+
+
+if __name__ == "__main__":
+    main()

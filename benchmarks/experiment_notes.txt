@@ -1,0 +1,43 @@
+E1: no memory pressure
+
+- E1.a: benchmark test with THP-on vs THP-off
+
+- E1.b: Different access patterns 
+    - uniform: random accesses spread evenly across all pages
+        Tests standard random-access workload
+    - sequential: strict linear walk through memory (64 bytes at a time)
+        Tests hardware prefetcher efficiency and sequential bandwidth
+    - hot-contig: 90% of accesses hit a contiguous 10% slice of memory
+        Test working set locality in a single contiguous region
+    - hot-scatter: 90% of accesses hit a scattered 10% slice of memory
+        Test TLB pressure and cache-miss penalty with non-contiguous hot spots
+
+E2: memory pressure
+
+- E2.a: RAM full, no swap - What does THP cost when free memory is low? (compare always vs never)
+    - locked filler leaves ~10 GB free on node 0
+    - measure: alloc total and max chunk, accesses/s, allocstall_*, pgscan_kswapd/direct, compact_stall, thp_fault_fallback
+    - how many file pages are kicked out (THP-on should be more)
+
+- E2.b: RAM fragmented, no swap - Stall versus fallback when no 2 MB block is free
+    - fragmenter (THP never, node 0, 4 KB pages, free random 80%)
+    - defrag: never, defer, always --> CPU utilization, how much mem is backed by hugepages (logged over time)
+    - measure: alloc total and max chunk, % huge pages (AnonHugePages), compact_*, kcompactd CPU, accesses/s
+
+E3: memory pressure with swap (swap pressure)
+
+- E3.a: clean swap - How do THP and reclaim interact once swapping starts?
+    - baseline
+
+- E3.b: Hot-scatter vs hot-contig under pressure - Does 2 MB granularity cost memory efficiency?
+    - measure: throughput, swap rates, AnonHugePages, splits
+
+- E3.c: Swap fragmentation - Does THP-on degrade over time because of swap fragmentation?
+    - swap state
+
+- from clean to fragmented --> how long can we swap out huge pages (solution: stop using huge pages at this point)
+    - would need to identify when we can restart
+
+
+With agentic workload: run more of them OR run them faster --> optimize toolcalling
+

@@ -1,0 +1,43 @@
+Case 1: no memory pressure --> benchmark to validate THP-on > THP-off
+- validate that THP-on activates hugepages
+- measure fault costs (allocate a block and touch every page to create a frame for it)
+- measure TLB benefit for random accesses (random-access loop, counting accesses per sec)
+
+Allocation step: 
+Access pattern:
+- Uniform: each access jumps to any address, with equal probability
+    - anticipate THP-on to perform better than THP-off under no mem constraints
+- Sequential: read pages in order, then the CPU predicts want you need ahead of time and one TLB entry gets reused
+- Hot-Cold: 90% accesses to a hot 10% of pages
+
+Case 2: memory pressure --> how does THP-on compare to THP-off? (Is this the question we're trying to answer in case 2?)
+- Experiment 2.1: how full RAM is --> in this experiment, just take up most of the space in RAM to give rise to direct 
+reclaim through watermarks (?) (but does this have anything to do with THP? does it matter if THP is on or off if pages 
+in general can't be allocated due to memory pressure?)
+- Experiment 2.2: how fragmented RAM is --> in this experiment, just allocate one page every 2MB bytes, that way there is a
+lot of free space, but no contiguous 2MB pages of space. (Here, would we do subtests with different defrag settings?) (What
+exactly is the purpose of this test, how are we testing the effects of kswapd for THP-on vs THP-off?)
+- Experiment 2.3: how fragmented swap is --> in this experiment, should I first see how it performs initially, when swap is 
+clean? Or is that something that is already being done maybe. Then, should I start from clean swap and see how long it takes 
+to make THP-on perform worse than THP-off purely because of fragmentation in the swap space. Or should I start with a 
+defragmented swap itself and just compare THP-on and THP-off. These are all in the access stages of memhog right?
+- Experiment 2.4: how much of a page is hot/cold --> compare THP-on vs off when large contiguous chunks of memory are hot vs
+when small random pieces of memory chunks are hot vs something else? 
+
+Case 1 shows THP’s benefit (fewer TLB misses, fewer faults). 
+Case 2 asks when that benefit becomes a cost. THP costs you in three ways:
+- It needs a contiguous, aligned 2MB block, which can trigger compaction and reclaim stalls.
+- Reclaim and swap work in 2MB units, so one hot 4KB piece keeps 2MB resident, or the page must be split.
+- Swap-out of a whole THP needs a contiguous swap cluster. If there isn’t one, it splits, and swap-in then brings back 
+4KB pages, which fragments swap further (your spiral).
+
+
+Counters:
+thp_fault_alloc / thp_fault_fallback	            Huge page obtained at fault / tried and fell back to 4 KB
+thp_split_page	                                    A huge page was split, for any reason
+thp_swpout / thp_swpout_fallback	                Huge page written to swap whole / had to be split first
+thp_collapse_alloc	                                khugepaged merged 4 KB pages into a huge page
+pswpin / pswpout	                                Pages read from / written to swap
+pgscan_kswapd / pgscan_direct	                    Reclaim work done by the background thread / by the program itself
+allocstall_*	                                    Times an allocation had to reclaim directly (the stall that hurts tail latency)
+compact_stall / compact_success / compact_fail	    Direct compaction attempts and outcomes

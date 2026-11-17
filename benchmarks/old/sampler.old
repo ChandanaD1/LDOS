@@ -1,0 +1,165 @@
+#!/usr/bin/env python3
+"""
+sampler.py -- records the kernel counters that EXPLAIN a benchmark result.
+
+Writes one CSV row per interval. Every counter is CUMULATIVE (as the kernel
+reports it); to analyze a window, subtract the first row from the last. Rate
+= difference between consecutive rows.
+
+Also imported by probe.py (snapshot()).
+
+  sudo ./sampler.py --out counters.csv [--interval 1] [--cgroup /sys/fs/cgroup/NAME]
+"""
+import argparse
+import os
+import signal
+import sys
+import time
+
+THP_DIR = "/sys/kernel/mm/transparent_hugepage"
+MTHP_2M = THP_DIR + "/hugepages-2048kB/stats"   # per-size stats; path assumes 4KB base pages
+
+# /proc/vmstat has ~200 keys; keep only the families this project reasons about.
+VM_PREFIXES = ("thp_", "pswp", "pgscan", "pgsteal", "pgmajfault", "pgfault",
+               "compact_", "allocstall", "kswapd_", "oom_kill", "workingset_refault")
+MEMINFO_KEYS = ("AnonHugePages", "AnonPages", "MemFree", "MemAvailable",
+                "SwapTotal", "SwapFree", "SwapCached", "Cached")
+
+
+def read_vmstat():
+    out = {}
+    with open("/proc/vmstat") as f:
+        for line in f:
+            k, v = line.split()
+            if k.startswith(VM_PREFIXES):
+                out[k] = int(v)
+    return out
+
+
+def read_meminfo():
+    out = {}
+    with open("/proc/meminfo") as f:
+        for line in f:
+            k, rest = line.split(":", 1)
+            if k in MEMINFO_KEYS:
+                out["mem_%s_kB" % k] = int(rest.split()[0])
+    return out
+
+
+def read_mthp():
+    """Per-size THP stats (swpout, swpout_fallback, swpin, split, ...). Missing on old kernels."""
+    out = {}
+    try:
+        names = os.listdir(MTHP_2M)
+    except OSError:
+        return out
+    for n in names:
+        try:
+            with open(os.path.join(MTHP_2M, n)) as f:
+                out["mthp2M_" + n] = int(f.read())
+        except (OSError, ValueError):
+            pass
+    return out
+
+
+def find_kthreads():
+    """pids of kernel threads whose CPU time we track (they persist, so look once)."""
+    groups = {"kswapd": [], "khugepaged": [], "kcompactd": []}
+    for pid in os.listdir("/proc"):
+        if not pid.isdigit():
+            continue
+        try:
+            with open("/proc/%s/comm" % pid) as f:
+                comm = f.read().strip()
+        except OSError:
+            continue
+        for g in groups:
+            if comm.startswith(g):
+                groups[g].append(pid)
+    return groups
+
+
+def cpu_seconds(groups):
+    """Cumulative CPU seconds (user+sys) of each kernel-thread group.
+    Background work never shows in the benchmark's own throughput, so we read it here."""
+    tick = os.sysconf("SC_CLK_TCK")
+    out = {}
+    for g, pids in groups.items():
+        total = 0
+        for pid in pids:
+            try:
+                with open("/proc/%s/stat" % pid) as f:
+                    s = f.read()
+            except OSError:
+                continue
+            fields = s.rsplit(")", 1)[1].split()   # split after comm, which may contain spaces
+            total += int(fields[11]) + int(fields[12])   # utime, stime (fields 14, 15)
+        out["cpu_%s_s" % g] = total / tick
+    return out
+
+
+def read_cgroup(cg):
+    out = {}
+    for fname, prefix in (("memory.stat", "cg_"), ("memory.events", "cgev_")):
+        try:
+            with open(os.path.join(cg, fname)) as f:
+                for line in f:
+                    p = line.split()
+                    if len(p) == 2 and p[1].lstrip("-").isdigit():
+                        out[prefix + p[0]] = int(p[1])
+        except OSError:
+            pass
+    for fname, key in (("memory.current", "cg_memory_current"), ("memory.swap.current", "cg_swap_current")):
+        try:
+            with open(os.path.join(cg, fname)) as f:
+                out[key] = int(f.read())
+        except (OSError, ValueError):
+            pass
+    return out
+
+
+def snapshot(groups=None, cgroup=None):
+    s = {}
+    s.update(read_vmstat())
+    s.update(read_meminfo())
+    s.update(read_mthp())
+    if groups:
+        s.update(cpu_seconds(groups))
+    if cgroup:
+        s.update(read_cgroup(cgroup))
+    return s
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--out", required=True)
+    ap.add_argument("--interval", type=float, default=1.0)
+    ap.add_argument("--cgroup", default=None)
+    a = ap.parse_args()
+
+    stop = []
+    signal.signal(signal.SIGTERM, lambda *_: stop.append(1))
+    signal.signal(signal.SIGINT, lambda *_: stop.append(1))
+
+    groups = find_kthreads()
+    header = None
+    nxt = time.time()
+    with open(a.out, "w") as out:
+        while not stop:
+            row = snapshot(groups, a.cgroup)
+            row["epoch"] = round(time.time(), 3)   # same clock as memhog's *_epoch values
+            if header is None:
+                header = ["epoch"] + sorted(k for k in row if k != "epoch")
+                out.write(",".join(header) + "\n")
+            out.write(",".join(str(row.get(k, "")) for k in header) + "\n")
+            out.flush()
+            nxt += a.interval
+            delay = nxt - time.time()
+            if delay > 0:
+                time.sleep(delay)
+            else:
+                nxt = time.time()
+
+
+if __name__ == "__main__":
+    main()

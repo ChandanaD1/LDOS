@@ -1,0 +1,10 @@
+sudo apt install python3-matplotlib
+
+experiment 1: sudo python3 exp1.py
+sudo python3 analyze_exp1.py 
+
+experiment 2: sudo python3 exp2.py
+sudo python3 analyze_exp1.py --root results/exp2_patterns
+
+experiment 2: sudo python3 exp3.py
+sudo python3 analyze_exp3.py

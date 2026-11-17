@@ -1,0 +1,373 @@
+/*
+ * memhog.c -- the one program every THP-vs-reclaim experiment runs.
+ *
+ * Build:  gcc -O2 -Wall -pthread -o memhog memhog.c
+ *
+ * Phases:
+ *   1. mmap a 2MB-aligned anonymous region.
+ *   2. ALLOCATION STEP (timed): write one 8-byte value into every 4KB page.
+ *      This is where fault-time costs live (page faults, zeroing a 2MB page,
+ *      direct reclaim / compaction stalls).
+ *   3. ACCESS STEP (timed, --duration seconds): random reads/writes.
+ *      A separate reporter thread prints one CSV row per second, so you see
+ *      throughput *over time* (needed to see "spiralling" in E3).
+ *   (--probe replaces step 3 with the swap probe handshake used by probe.py.)
+ *
+ * Everything the harness needs is printed as lines starting with "RESULT ".
+ */
+#define _GNU_SOURCE
+#include <errno.h>
+#include <getopt.h>
+#include <inttypes.h>
+#include <pthread.h>
+#include <stdatomic.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/mman.h>
+#include <sys/resource.h>
+#include <time.h>
+#include <unistd.h>
+
+#define PG 4096UL                 /* base page size (x86-64) */
+#define HP (2UL << 20)            /* PMD-sized huge page = 2MB */
+#define PG_PER_HP (HP / PG)       /* 512 */
+#define NB 256                    /* latency histogram buckets */
+
+enum pattern { P_UNIFORM, P_HOT_SCATTER, P_HOT_CONTIG };
+enum advise_t { A_NONE, A_HUGE, A_NOHUGE };
+
+static struct {
+    size_t size_mb;
+    int duration;          /* access step length in seconds; 0 = skip */
+    enum pattern pat;
+    double hot_frac;       /* fraction of pages that are "hot" */
+    double hot_prob;       /* probability an access goes to the hot set */
+    int write_pct;         /* % of accesses that also store (dirty the page) */
+    int dependent;         /* 1 = next address depends on loaded value */
+    int lat_shift;         /* time 1 in 2^lat_shift accesses */
+    enum advise_t advise;
+    int advise_after;      /* apply madvise after allocation (E1b) */
+    int probe;
+    const char *csv;
+    uint64_t seed;
+} cfg = { .size_mb = 1024, .duration = 60, .pat = P_UNIFORM, .hot_frac = 0.10,
+          .hot_prob = 0.90, .write_pct = 50, .dependent = 0, .lat_shift = 6,
+          .advise = A_NONE, .advise_after = 0, .probe = 0, .csv = NULL,
+          .seed = 12345 };
+
+static uint8_t *base;
+static uint64_t npages, nchunks, hot_pages;
+static uint64_t dom_bits, dom_mask, dom_shift;
+
+static _Atomic uint64_t g_acc;       /* total accesses so far (worker writes) */
+static _Atomic uint64_t g_hist[NB];  /* latency histogram of sampled accesses */
+static _Atomic int g_stop;
+
+static void die(const char *m) { perror(m); exit(1); }
+
+static inline uint64_t now_ns(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint64_t)ts.tv_sec * 1000000000ULL + ts.tv_nsec;
+}
+static double epoch_s(void) {        /* wall clock, to align with sampler.py */
+    struct timespec ts;
+    clock_gettime(CLOCK_REALTIME, &ts);
+    return ts.tv_sec + ts.tv_nsec * 1e-9;
+}
+
+/* ---- random numbers: xorshift64* (fast; the access loop must not be
+ * bottlenecked by the RNG) ---- */
+static uint64_t splitmix(uint64_t x) {
+    x += 0x9E3779B97F4A7C15ULL;
+    x = (x ^ (x >> 30)) * 0xBF58476D1CE4E5B9ULL;
+    x = (x ^ (x >> 27)) * 0x94D049BB133111EBULL;
+    return x ^ (x >> 31);
+}
+static inline uint64_t xs(uint64_t *s) {
+    uint64_t x = *s;
+    x ^= x >> 12; x ^= x << 25; x ^= x >> 27;
+    *s = x;
+    return x * 0x2545F4914F6CDD1DULL;
+}
+
+/*
+ * Scattering the hot set without storing a list.
+ * mix() is a bijection (permutation) on [0, 2^dom_bits): odd multiplies mod 2^k
+ * and xor-right-shifts are both invertible. scatter() "cycle-walks" it so it is
+ * a bijection on [0, npages) for any npages. So hot page k (k < hot_pages) lives
+ * at scatter(k): distinct, pseudo-randomly placed, and no metadata array whose
+ * own cache/TLB misses would pollute the measurement.
+ */
+static inline uint64_t mix(uint64_t x) {
+    x = (x * 0x9E3779B97F4A7C15ULL) & dom_mask; x ^= x >> dom_shift;
+    x = (x * 0xBF58476D1CE4E5B9ULL) & dom_mask; x ^= x >> dom_shift;
+    x = (x * 0x94D049BB133111EBULL) & dom_mask; x ^= x >> dom_shift;
+    return x;
+}
+static inline uint64_t scatter(uint64_t k) {
+    do { k = mix(k); } while (k >= npages);
+    return k;
+}
+
+/* ---- latency histogram: 4 sub-buckets per power of two (~25% resolution) ---- */
+static inline int lat_bucket(uint64_t ns) {
+    if (ns < 4) return (int)ns;
+    int msb = 63 - __builtin_clzll(ns);
+    int sub = (int)((ns >> (msb - 2)) & 3);
+    return ((msb - 1) << 2) | sub;
+}
+static uint64_t bucket_upper(int i) {
+    if (i < 4) return (uint64_t)i + 1;
+    int msb = (i >> 2) + 1, sub = i & 3;
+    return (uint64_t)(4 + sub + 1) << (msb - 2);
+}
+static uint64_t pct_ns(const uint64_t *d, uint64_t tot, double q) {
+    if (!tot) return 0;
+    uint64_t need = (uint64_t)(q * (double)tot + 0.999999), cum = 0;
+    if (!need) need = 1;
+    for (int i = 0; i < NB; i++) { cum += d[i]; if (cum >= need) return bucket_upper(i); }
+    return bucket_upper(NB - 1);
+}
+
+/* ---- per-process THP/swap view from the kernel ---- */
+static void print_smaps(const char *tag) {
+    FILE *f = fopen("/proc/self/smaps_rollup", "r");
+    if (!f) return;
+    char line[256];
+    long rss = -1, swap = -1, ahp = -1;
+    while (fgets(line, sizeof line, f)) {
+        sscanf(line, "Rss: %ld kB", &rss);
+        sscanf(line, "Swap: %ld kB", &swap);
+        sscanf(line, "AnonHugePages: %ld kB", &ahp);
+    }
+    fclose(f);
+    printf("RESULT %s_rss_mb=%.1f\nRESULT %s_swap_mb=%.1f\nRESULT %s_anon_huge_mb=%.1f\n",
+           tag, rss / 1024.0, tag, swap / 1024.0, tag, ahp / 1024.0);
+}
+
+static int cmp_u64(const void *a, const void *b) {
+    uint64_t x = *(const uint64_t *)a, y = *(const uint64_t *)b;
+    return x < y ? -1 : x > y;
+}
+
+static void map_region(size_t bytes) {
+    /* Over-allocate by 2MB, align up, then trim, so the VMA is exactly the
+     * aligned region: every 2MB range inside it is THP-eligible. */
+    uint8_t *raw = mmap(NULL, bytes + HP, PROT_READ | PROT_WRITE,
+                        MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (raw == MAP_FAILED) die("mmap");
+    base = (uint8_t *)(((uintptr_t)raw + HP - 1) & ~(HP - 1));
+    if (base > raw) munmap(raw, base - raw);
+    uint8_t *end = base + bytes, *raw_end = raw + bytes + HP;
+    if (raw_end > end) munmap(end, raw_end - end);
+}
+
+static void apply_advise(void) {
+    int a = cfg.advise == A_HUGE ? MADV_HUGEPAGE : cfg.advise == A_NOHUGE ? MADV_NOHUGEPAGE : -1;
+    if (a < 0) return;
+    if (madvise(base, npages * PG, a)) perror("madvise");
+    printf("RESULT advise_epoch=%.3f\n", epoch_s());
+}
+
+static void alloc_step(void) {
+    uint64_t *ck = malloc(nchunks * sizeof *ck);
+    if (!ck) die("malloc");
+    printf("RESULT alloc_start_epoch=%.3f\n", epoch_s());
+    uint64_t T0 = now_ns();
+    for (uint64_t c = 0; c < nchunks; c++) {
+        uint64_t t0 = now_ns();
+        for (uint64_t p = 0; p < PG_PER_HP; p++) {
+            uint64_t pg = c * PG_PER_HP + p;
+            /* Non-zero value: keeps the page from being "all zeros", which
+             * newer kernels treat specially (zero-page / underused-THP split). */
+            *(volatile uint64_t *)(base + pg * PG) = 0x9E3779B97F4A7C15ULL ^ pg;
+        }
+        ck[c] = now_ns() - t0;
+    }
+    uint64_t total = now_ns() - T0;
+    printf("RESULT alloc_end_epoch=%.3f\n", epoch_s());
+    qsort(ck, nchunks, sizeof *ck, cmp_u64);
+    printf("RESULT alloc_total_s=%.4f\n", total / 1e9);
+    printf("RESULT alloc_chunk_median_ms=%.4f\n", ck[nchunks / 2] / 1e6);
+    printf("RESULT alloc_chunk_p99_ms=%.4f\n", ck[(nchunks * 99) / 100] / 1e6);
+    printf("RESULT alloc_chunk_max_ms=%.4f\n", ck[nchunks - 1] / 1e6);
+    free(ck);
+}
+
+/* Sanity check for E2b: how many hot pages land in each 2MB region?
+ * Scatter should give ~hot_frac*512 per region; contiguous gives 0 or 512. */
+static void report_hot_spread(void) {
+    if (cfg.pat == P_UNIFORM) return;
+    uint32_t *cnt = calloc(nchunks, sizeof *cnt);
+    if (!cnt) die("calloc");
+    for (uint64_t k = 0; k < hot_pages; k++) {
+        uint64_t pg = cfg.pat == P_HOT_SCATTER ? scatter(k) : k;
+        cnt[pg / PG_PER_HP]++;
+    }
+    uint32_t mn = UINT32_MAX, mx = 0;
+    for (uint64_t c = 0; c < nchunks; c++) { if (cnt[c] < mn) mn = cnt[c]; if (cnt[c] > mx) mx = cnt[c]; }
+    printf("RESULT hot_pages_per_2MB_min=%u\nRESULT hot_pages_per_2MB_max=%u\nRESULT hot_pages_per_2MB_mean=%.1f\n",
+           mn, mx, (double)hot_pages / nchunks);
+    free(cnt);
+}
+
+/* One row per second, from a separate thread so a worker stuck in a major
+ * fault (swap-in) doesn't stop the reporting. */
+static void *reporter(void *unused) {
+    (void)unused;
+    FILE *out = cfg.csv ? fopen(cfg.csv, "w") : stdout;
+    if (!out) { perror("csv"); out = stdout; }
+    fprintf(out, "epoch,t_s,accesses,acc_per_s,lat_samples,p50_ns,p99_ns,p999_ns,minflt,majflt\n");
+    uint64_t t0 = now_ns(), prev_t = t0, next = t0 + 1000000000ULL, prev_acc = 0;
+    uint64_t prev_h[NB] = {0};
+    long prev_min = 0, prev_maj = 0;
+    for (;;) {
+        struct timespec ts = { next / 1000000000ULL, next % 1000000000ULL };
+        clock_nanosleep(CLOCK_MONOTONIC, TIMER_ABSTIME, &ts, NULL);
+        uint64_t t = now_ns(), acc = atomic_load(&g_acc), d[NB], tot = 0;
+        for (int i = 0; i < NB; i++) {
+            uint64_t h = atomic_load(&g_hist[i]);
+            d[i] = h - prev_h[i]; prev_h[i] = h; tot += d[i];
+        }
+        struct rusage ru;
+        getrusage(RUSAGE_SELF, &ru);
+        double dt = (t - prev_t) / 1e9;
+        fprintf(out, "%.3f,%.1f,%" PRIu64 ",%.1f,%" PRIu64 ",%" PRIu64 ",%" PRIu64 ",%" PRIu64 ",%ld,%ld\n",
+                epoch_s(), (t - t0) / 1e9, acc - prev_acc, (acc - prev_acc) / dt, tot,
+                pct_ns(d, tot, 0.50), pct_ns(d, tot, 0.99), pct_ns(d, tot, 0.999),
+                ru.ru_minflt - prev_min, ru.ru_majflt - prev_maj);
+        fflush(out);
+        prev_t = t; prev_acc = acc; prev_min = ru.ru_minflt; prev_maj = ru.ru_majflt;
+        if (t - t0 >= (uint64_t)cfg.duration * 1000000000ULL) { atomic_store(&g_stop, 1); break; }
+        next += 1000000000ULL;
+    }
+    if (out != stdout) fclose(out);
+    return NULL;
+}
+
+static void access_step(void) {
+    pthread_t th;
+    printf("RESULT access_start_epoch=%.3f\n", epoch_s());
+    if (pthread_create(&th, NULL, reporter, NULL)) die("pthread_create");
+    uint64_t rng = splitmix(cfg.seed) | 1, n = 0;
+    uint64_t smask = (1ULL << cfg.lat_shift) - 1;
+    uint64_t hot_thr = (uint64_t)(cfg.hot_prob * 16777216.0);   /* 24-bit coin */
+    uint64_t wthr = (uint64_t)cfg.write_pct * 128 / 100;        /* vs 7 bits */
+    uint64_t T0 = now_ns();
+
+    while (!atomic_load_explicit(&g_stop, memory_order_relaxed)) {
+        uint64_t r = xs(&rng), pg;
+        if (cfg.pat == P_UNIFORM) {
+            pg = r % npages;
+        } else {
+            uint64_t j = xs(&rng);
+            int hot = ((r >> 24) & 0xFFFFFF) < hot_thr;
+            uint64_t k = hot ? j % hot_pages : hot_pages + j % (npages - hot_pages);
+            pg = cfg.pat == P_HOT_SCATTER ? scatter(k) : k;
+        }
+        uint64_t off = ((r >> 48) & 511) * 8;   /* random 8B slot inside the page */
+        volatile uint64_t *p = (volatile uint64_t *)(base + pg * PG + off);
+        int sample = (n & smask) == 0;
+        uint64_t t0 = sample ? now_ns() : 0;
+        uint64_t v = *p;
+        if ((r >> 57) < wthr) *p = v + 1;        /* dirty the page */
+        if (sample) atomic_fetch_add_explicit(&g_hist[lat_bucket(now_ns() - t0)], 1, memory_order_relaxed);
+        if (cfg.dependent) rng = (rng ^ v) | 1;  /* next address needs this load */
+        n++;
+        atomic_store_explicit(&g_acc, n, memory_order_relaxed);
+    }
+    double el = (now_ns() - T0) / 1e9;
+    pthread_join(th, NULL);
+    printf("RESULT access_total=%" PRIu64 "\nRESULT access_elapsed_s=%.3f\nRESULT access_mean_per_s=%.1f\n",
+           n, el, n / el);
+}
+
+/* Probe handshake (driven by probe.py):
+ *  READY -> (harness evicts memory via memory.reclaim) -> "go" on stdin ->
+ *  find a region that is no longer resident (mincore), read one byte of it. */
+static void probe_step(void) {
+    printf("READY\n"); fflush(stdout);
+    char line[64];
+    if (!fgets(line, sizeof line, stdin)) return;
+    unsigned char *vec = malloc(npages);
+    if (!vec || mincore(base, npages * PG, vec)) die("mincore");
+    uint64_t nonres = 0, full = 0;
+    int64_t first_full = -1, first_non = -1;
+    for (uint64_t c = 0; c < nchunks; c++) {
+        int cnt = 0;
+        for (uint64_t p = 0; p < PG_PER_HP; p++) {
+            if (!(vec[c * PG_PER_HP + p] & 1)) {
+                cnt++;
+                if (first_non < 0) first_non = c * PG_PER_HP + p;
+            }
+        }
+        nonres += cnt;
+        if (cnt == PG_PER_HP) { full++; if (first_full < 0) first_full = c * PG_PER_HP; }
+    }
+    printf("RESULT probe_nonresident_pages=%" PRIu64 "\nRESULT probe_fully_evicted_2MB_regions=%" PRIu64 "\n", nonres, full);
+    int64_t target = first_full >= 0 ? first_full : first_non;
+    if (target < 0) { printf("NO_EVICTED\nDONE\n"); return; }
+    volatile uint8_t *p = base + target * PG + 64;
+    uint8_t x = *p; (void)x;                       /* the one-byte read */
+    printf("TOUCHED page=%" PRId64 " whole_2MB_region_was_evicted=%d\nDONE\n", target, first_full >= 0);
+}
+
+int main(int argc, char **argv) {
+    setvbuf(stdout, NULL, _IOLBF, 0);
+    static struct option opts[] = {
+        {"size-mb", 1, 0, 's'}, {"duration", 1, 0, 'd'}, {"pattern", 1, 0, 'p'},
+        {"hot-frac", 1, 0, 'f'}, {"hot-prob", 1, 0, 'P'}, {"write-pct", 1, 0, 'w'},
+        {"dependent", 0, 0, 'D'}, {"lat-shift", 1, 0, 'l'}, {"advise", 1, 0, 'a'},
+        {"advise-when", 1, 0, 'W'}, {"probe", 0, 0, 'R'}, {"csv", 1, 0, 'c'},
+        {"seed", 1, 0, 'S'}, {0, 0, 0, 0} };
+    int o;
+    while ((o = getopt_long(argc, argv, "", opts, NULL)) != -1) {
+        switch (o) {
+        case 's': cfg.size_mb = strtoull(optarg, 0, 10); break;
+        case 'd': cfg.duration = atoi(optarg); break;
+        case 'p': cfg.pat = !strcmp(optarg, "uniform") ? P_UNIFORM :
+                            !strcmp(optarg, "hot-scatter") ? P_HOT_SCATTER :
+                            !strcmp(optarg, "hot-contig") ? P_HOT_CONTIG : (fprintf(stderr, "bad --pattern\n"), exit(2), 0); break;
+        case 'f': cfg.hot_frac = atof(optarg); break;
+        case 'P': cfg.hot_prob = atof(optarg); break;
+        case 'w': cfg.write_pct = atoi(optarg); break;
+        case 'D': cfg.dependent = 1; break;
+        case 'l': cfg.lat_shift = atoi(optarg); break;
+        case 'a': cfg.advise = !strcmp(optarg, "none") ? A_NONE : !strcmp(optarg, "huge") ? A_HUGE :
+                               !strcmp(optarg, "nohuge") ? A_NOHUGE : (fprintf(stderr, "bad --advise\n"), exit(2), 0); break;
+        case 'W': cfg.advise_after = !strcmp(optarg, "after"); break;
+        case 'R': cfg.probe = 1; break;
+        case 'c': cfg.csv = optarg; break;
+        case 'S': cfg.seed = strtoull(optarg, 0, 10); break;
+        default: return 2;
+        }
+    }
+    size_t bytes = (cfg.size_mb << 20) & ~(HP - 1);
+    if (!bytes) { fprintf(stderr, "size too small\n"); return 2; }
+    npages = bytes / PG; nchunks = bytes / HP;
+    hot_pages = (uint64_t)(npages * cfg.hot_frac);
+    if (hot_pages < 1) hot_pages = 1;
+    if (hot_pages >= npages) hot_pages = npages - 1;
+    dom_bits = 2;
+    while ((1ULL << dom_bits) < npages) dom_bits++;
+    dom_mask = (1ULL << dom_bits) - 1;
+    dom_shift = (dom_bits + 1) / 2;
+
+    printf("RESULT size_mb=%zu\nRESULT pid=%d\n", bytes >> 20, getpid());
+    map_region(bytes);
+    if (!cfg.advise_after) apply_advise();
+    alloc_step();
+    if (cfg.advise_after) apply_advise();
+    print_smaps("after_alloc");
+
+    if (cfg.probe) { probe_step(); return 0; }
+    if (cfg.duration > 0) {
+        report_hot_spread();
+        access_step();
+        print_smaps("end");
+    }
+    return 0;
+}

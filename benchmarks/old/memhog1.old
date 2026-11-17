@@ -1,0 +1,101 @@
+/*
+
+Allocation step: map the array, touch every 4 KB page once, measure time (fault cost)
+ACCESS STEP: random reads/writes inside the same array, measure accesses per second.
+
+*/
+
+
+#define _GNU_SOURCE
+#include <stdio.h>
+#include <stdlib.h>
+#include <stdint.h>
+#include <time.h>
+#include <unistd.h>
+#include <sys/mman.h>
+
+#define PAGE 4096UL                 // normal page size
+#define HUGE (2UL * 1024 * 1024)    // 2 MB = one huge page
+#define PAGES_PER_HUGE (HUGE / PAGE)
+
+// returns the current time in seconds
+static double now_sec(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return ts.tv_sec + ts.tv_nsec / 1e9;
+}
+
+// cheap random number generator 
+static uint64_t rng_next(uint64_t *s) {
+    uint64_t x = *s;
+    x ^= x >> 12; x ^= x << 25; x ^= x >> 27;
+    *s = x;
+    return x * 0x2545F4914F6CDD1DULL;
+}
+
+int main(int argc, char **argv) {
+    size_t size_mb = (argc > 1) ? strtoul(argv[1], NULL, 10) : 1024;
+    size_t size = (size_mb * 1024 * 1024) & ~(HUGE - 1);  // round down to a multiple of 2 MB for alignment
+    size_t npages = size / PAGE;
+    size_t nchunks = size / HUGE;
+
+    int seconds = 60;
+    //int write_pct = 50;
+
+    // mmap the "size" chunk (extra work for alignment)
+    uint8_t *raw = mmap(NULL, size + HUGE, PROT_READ | PROT_WRITE,
+                        MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (raw == MAP_FAILED) { perror("mmap"); return 1; }
+    uint8_t *base = (uint8_t *)(((uintptr_t)raw + HUGE - 1) & ~(HUGE - 1));
+
+    printf("size_mb=%zu pages=%zu chunks_2MB=%zu pid=%d\n", size >> 20, npages, nchunks, getpid());
+
+
+    // ALLOCATION STEP: touch one byte in every 4 KB page to allocate a physical frame, and time it.
+    volatile uint8_t *p = base;
+    double t0 = now_sec();
+    double max_chunk = 0;  // tail-latency
+    for (size_t c = 0; c < nchunks; c++) {
+        double c0 = now_sec();
+        for (size_t i = 0; i < PAGES_PER_HUGE; i++)
+            p[(c * PAGES_PER_HUGE + i) * PAGE] = 1;    // page fault
+        double d = now_sec() - c0;
+        if (d > max_chunk) max_chunk = d;
+    }
+    double alloc_s = now_sec() - t0;
+    printf("alloc_total_s=%.4f\n", alloc_s);
+    printf("alloc_chunk_mean_ms=%.4f\n", alloc_s / nchunks * 1000);
+    printf("alloc_chunk_max_ms=%.4f\n", max_chunk * 1000);
+
+
+    // ACCESS STEP
+    uint64_t rng = 88172645463325252ULL; // fixed seed
+    uint64_t n = 0, last_n = 0;
+    double start = now_sec(), last_t = start;
+    for (;;) {
+        uint64_t r = rng_next(&rng);
+        size_t page = r % npages;         // Picks a random 4 KB page
+        size_t slot = (r >> 40) & 511;    // Picks a random offset within the page 
+        volatile uint64_t *addr = (volatile uint64_t *)(base + page * PAGE + slot * 8);
+        uint64_t v = *addr;   // read
+        //if ((((r >> 52) * 100) >> 12) < (uint64_t)write_pct)  // write
+            //*addr = v + 1;                              
+        n++;
+
+        if ((n & 255) == 0) {   // check the clock every 256 accesses
+            double t = now_sec();
+            if (t - last_t >= 1.0) {
+                printf("t=%3.0f s  accesses_per_s=%.0f\n", t - start, (n - last_n) / (t - last_t));
+                last_t = t;
+                last_n = n;
+            }
+            if (t - start >= seconds) break;
+        }
+    }
+
+    double elapsed = now_sec() - start;
+    printf("access_total=%llu\n", (unsigned long long)n);
+    printf("access_elapsed_s=%.3f\n", elapsed);
+    printf("access_mean_per_s=%.0f\n", n / elapsed);
+    return 0;
+}
